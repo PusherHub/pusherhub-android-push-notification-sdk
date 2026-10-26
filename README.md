@@ -1,6 +1,6 @@
-# PusherHub Android SDK (Kotlin and Java)
+# PusherHub Android SDK (Kotlin and Java) — Android push notifications
 
-Push notifications and in-app messages for your native Android app, sent through your own Firebase project with [PusherHub](https://pusherhub.com).
+Push notifications and in-app messages for your native Android app: a free push notification service that sends through your own Firebase project with Firebase Cloud Messaging (FCM), using [PusherHub](https://pusherhub.com).
 
 [Website](https://pusherhub.com) · [Guides](https://pusherhub.com/docs) · [Pricing](https://pusherhub.com/pricing)
 
