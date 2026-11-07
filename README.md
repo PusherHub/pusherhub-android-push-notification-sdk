@@ -10,8 +10,8 @@ Push notifications and in-app messages for your native Android app: a free push 
 - Links a phone to your own user id with `login()` — remembered across restarts until `logout()`
 - Reports notification opens and clicks, and follows a notification's deep link
 - Hands your app each tapped notification's Custom Data, so you can open the right screen
-- Shows in-app messages (banner, modal, full screen, center popup, bottom sheet) with plain Android views — works with Compose and classic Views
-- Optional device details, and state and city if you add the location permission
+- Shows in-app messages (banner, modal, full screen, center popup, bottom sheet) with plain Android views, fitted to portrait and landscape screens — works with Compose and classic Views
+- Optional device details; state and city come from the phone's IP address, or from GPS only when your app already has location permission. The SDK never asks for location.
 
 One file, two languages — use whichever your app is written in:
 
@@ -56,8 +56,6 @@ No extra libraries: the SDK uses Android's built-in `HttpURLConnection` and `org
    ```xml
    <uses-permission android:name="android.permission.INTERNET"/>
    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-   <!-- Only if you want state and city from collectDeviceMetadata() -->
-   <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
 
    <application ...>
        <activity android:name=".MainActivity" ...>
@@ -119,7 +117,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Optional: shows in-app messages on open and resume.
+        // Shows your in-app messages on open and resume. Keep it, or they never appear.
         PusherHub.checkForInAppMessages(this)
     }
 }

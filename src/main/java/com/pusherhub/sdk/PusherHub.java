@@ -27,10 +27,12 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
@@ -38,6 +40,7 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
@@ -144,7 +147,13 @@ public final class PusherHub {
     private static final long HEARTBEAT_INTERVAL_MS = 60_000L;
 
     private static final int REQUEST_CODE_NOTIFICATIONS = 9427;
-    private static final int REQUEST_CODE_LOCATION = 9428;
+
+    // The widest a card-style in-app message gets: about a phone held upright,
+    // so a landscape screen or a tablet shows a card rather than a strip.
+    private static final int MAX_CARD_WIDTH_DP = 560;
+
+    // The widest a fullscreen message's text and buttons get.
+    private static final int MAX_FULLSCREEN_WIDTH_DP = 640;
 
     private static Context appContext;
     private static String appKey;
@@ -180,8 +189,6 @@ public final class PusherHub {
     private static String timezone;
     private static String state;
     private static String city;
-
-    private static Runnable pendingAfterLocationPermission;
 
     // True from the moment the POST_NOTIFICATIONS prompt is shown until its
     // outcome is observed. Notifications read as disabled while the dialog is
@@ -428,18 +435,13 @@ public final class PusherHub {
      * version, language, country, timezone, state, and city.
      *
      * Brand/model/version/language/timezone are read directly from the OS —
-     * no permission needed for those. State and city additionally need a
-     * GPS fix + reverse geocoding: this prompts for ACCESS_COARSE_LOCATION
-     * (needs the Activity captured in {@link #initialize} — same requirement
-     * as the notification permission) and uses Android's own built-in
-     * Geocoder, so no extra dependency or API key is needed for this
-     * either. If location is denied, unavailable, or there's no Activity to
-     * prompt from, this fails quietly and state/city simply stay unset — it
-     * never blocks the rest of registration.
-     *
-     * Forward your Activity's onRequestPermissionsResult() to
-     * {@link #onRequestPermissionsResult} or the location prompt's result
-     * will never reach this call.
+     * no permission needed for those. State and city come from the device's
+     * IP address on the backend. Only an app that already has a location
+     * permission (it declares and asks for ACCESS_COARSE_LOCATION or
+     * ACCESS_FINE_LOCATION itself) gets them from GPS instead, through
+     * Android's own built-in Geocoder — no extra dependency or API key.
+     * This never asks for a location permission: an app without one needs
+     * no location entry in its manifest for PusherHub.
      *
      * Safe to call any time after {@link #registerDevice} has completed.
      */
@@ -480,52 +482,33 @@ public final class PusherHub {
      * onRequestPermissionsResult(requestCode, permissions, grantResults)
      * here.
      *
-     * <p>Required if you call {@link #collectDeviceMetadata} (which may
-     * prompt for location). Optional for the notification permission:
-     * forwarding just reports the user's answer to the backend the instant
-     * they tap Allow/Don't allow instead of on the app's next foreground.
+     * <p>Optional: forwarding just reports the user's answer to the
+     * notification permission to the backend the instant they tap
+     * Allow/Don't allow, instead of on the app's next foreground.
      */
     public static void onRequestPermissionsResult(int requestCode) {
         if (requestCode == REQUEST_CODE_NOTIFICATIONS) {
             syncNotificationPermissionIfChanged();
-            return;
         }
-        if (requestCode != REQUEST_CODE_LOCATION) return;
-        Runnable callback = pendingAfterLocationPermission;
-        pendingAfterLocationPermission = null;
-        if (callback != null) callback.run();
     }
 
     /**
      * Resolves state/city (and overrides country with the geocoded value,
      * more trustworthy than the locale-based guess) via GPS + Android's
-     * built-in Geocoder, then always calls onComplete — whether resolution
-     * succeeded, failed, or was skipped entirely.
+     * built-in Geocoder — only when the app already has a location
+     * permission, never asking for one — then always calls onComplete,
+     * whether resolution succeeded, failed, or was skipped.
      */
     private static void resolveStateAndCity(Runnable onComplete) {
-        boolean hasPermission = ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_COARSE_LOCATION)
-                == PackageManager.PERMISSION_GRANTED;
-        if (hasPermission) {
-            fetchLocationAndGeocode(onComplete);
-            return;
-        }
-
-        Activity activity = activityRef != null ? activityRef.get() : null;
-        if (activity == null) {
-            Log.w(TAG, "Location permission not granted and no Activity available to request it — skipping state/city resolution.");
+        boolean granted = ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                || ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        if (!granted) {
+            // State and city then come from the device's IP address.
             onComplete.run();
             return;
         }
 
-        pendingAfterLocationPermission = () -> {
-            if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                fetchLocationAndGeocode(onComplete);
-            } else {
-                Log.w(TAG, "Location permission denied — skipping state/city resolution.");
-                onComplete.run();
-            }
-        };
-        ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.ACCESS_COARSE_LOCATION}, REQUEST_CODE_LOCATION);
+        fetchLocationAndGeocode(onComplete);
     }
 
     private static void fetchLocationAndGeocode(Runnable onComplete) {
@@ -825,15 +808,20 @@ public final class PusherHub {
             int gravity;
             int width;
             int height;
+            // No wider than a phone held upright, centred: a landscape screen
+            // or a tablet gets a card, not a strip across it. A phone held
+            // upright is narrower than that, so it keeps the full width.
+            DisplayMetrics metrics = activity.getResources().getDisplayMetrics();
+            int cardWidth = Math.min(metrics.widthPixels, dp(MAX_CARD_WIDTH_DP, metrics.density));
             switch (message.type) {
                 case "banner":
-                    gravity = Gravity.TOP;
-                    width = ViewGroup.LayoutParams.MATCH_PARENT;
+                    gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                    width = cardWidth;
                     height = ViewGroup.LayoutParams.WRAP_CONTENT;
                     break;
                 case "bottom_sheet":
-                    gravity = Gravity.BOTTOM;
-                    width = ViewGroup.LayoutParams.MATCH_PARENT;
+                    gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                    width = cardWidth;
                     height = ViewGroup.LayoutParams.WRAP_CONTENT;
                     break;
                 case "fullscreen":
@@ -843,7 +831,7 @@ public final class PusherHub {
                     break;
                 default: // modal / center_popup
                     gravity = Gravity.CENTER;
-                    width = ViewGroup.LayoutParams.MATCH_PARENT;
+                    width = cardWidth;
                     height = ViewGroup.LayoutParams.WRAP_CONTENT;
             }
             window.setGravity(gravity);
@@ -865,39 +853,69 @@ public final class PusherHub {
             return buildHtmlView(context, message, onAction);
         }
 
-        float density = context.getResources().getDisplayMetrics().density;
+        DisplayMetrics screen = context.getResources().getDisplayMetrics();
+        float density = screen.density;
+        boolean isFullscreen = "fullscreen".equals(message.type);
 
         FrameLayout outer = new FrameLayout(context);
-        int outerMargin = "fullscreen".equals(message.type) ? 0 : dp(8, density);
+        int outerMargin = isFullscreen ? 0 : dp(8, density);
         outer.setPadding(outerMargin, outerMargin, outerMargin, outerMargin);
 
-        LinearLayout card = new LinearLayout(context);
-        card.setOrientation(LinearLayout.VERTICAL);
-        int pad = dp(message.padding != null ? message.padding : 16, density);
-        card.setPadding(pad, pad, pad, pad);
+        // `card` holds the background (colour, corners, optional picture);
+        // `content` holds the message and scrolls inside it, so the
+        // background never takes up flow space of its own.
+        FrameLayout card = new FrameLayout(context);
         GradientDrawable cardBackground = new GradientDrawable();
-        cardBackground.setCornerRadius("fullscreen".equals(message.type) ? 0f : dp(16, density));
+        cardBackground.setCornerRadius(isFullscreen ? 0f : dp(16, density));
         cardBackground.setColor(parseColorOrDefault(message.backgroundColor, "#FFFFFF"));
         card.setBackground(cardBackground);
+        card.setClipToOutline(true);
+
+        LinearLayout content = new LinearLayout(context);
+        content.setOrientation(LinearLayout.VERTICAL);
+        // A fullscreen message sits in the middle of the screen.
+        if (isFullscreen) content.setGravity(Gravity.CENTER_VERTICAL);
+        int pad = dp(message.padding != null ? message.padding : 16, density);
+        content.setPadding(pad, pad, pad, pad);
+
+        int textColor = parseColorOrDefault(message.textColor, "#0F172A");
+        if ("blocks".equals(message.contentMode)) {
+            buildBlocksContent(context, content, message.blocks, textColor, onAction);
+        } else {
+            buildSimpleContent(context, content, message, textColor, onAction);
+        }
+
+        // Scrolls once the message is taller than the screen, as it can be
+        // in landscape; a banner stops at about half the screen. A fullscreen
+        // message fills the screen, with its content no wider than
+        // MAX_FULLSCREEN_WIDTH_DP in the middle.
+        CappedScrollView scroll = new CappedScrollView(context, "banner".equals(message.type) ? (int) (screen.heightPixels * 0.6) : null);
+        scroll.setFillViewport(isFullscreen);
+        scroll.addView(content, new FrameLayout.LayoutParams(
+                isFullscreen ? Math.min(screen.widthPixels, dp(MAX_FULLSCREEN_WIDTH_DP, density)) : ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL));
+        int fill = isFullscreen ? ViewGroup.LayoutParams.MATCH_PARENT : ViewGroup.LayoutParams.WRAP_CONTENT;
+        card.addView(scroll, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, fill));
 
         if (message.backgroundImage != null && !message.backgroundImage.isEmpty()) {
             ImageView bgImage = new ImageView(context);
             bgImage.setScaleType(ImageView.ScaleType.CENTER_CROP);
             loadImageAsync(message.backgroundImage, bgImage);
-            card.addView(
-                    bgImage,
-                    0,
-                    new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            // Starts at 0×0 so it can't stretch the card while it's measured,
+            // then takes the card's final size once laid out: a picture
+            // behind the message, not a box in its flow.
+            card.addView(bgImage, 0, new FrameLayout.LayoutParams(0, 0));
+            card.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
+                @Override
+                public void onGlobalLayout() {
+                    card.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                    bgImage.setLayoutParams(new FrameLayout.LayoutParams(card.getWidth(), card.getHeight()));
+                }
+            });
         }
 
-        int textColor = parseColorOrDefault(message.textColor, "#0F172A");
-        if ("blocks".equals(message.contentMode)) {
-            buildBlocksContent(context, card, message.blocks, textColor, onAction);
-        } else {
-            buildSimpleContent(context, card, message, textColor, onAction);
-        }
-
-        outer.addView(card, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        outer.addView(card, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, fill));
 
         if (message.showCloseButton) {
             TextView closeButton = new TextView(context);
@@ -1783,6 +1801,30 @@ public final class PusherHub {
                 return null;
             }
             return value;
+        }
+    }
+
+    /**
+     * A ScrollView that stops growing at maxHeightPx (null: it doesn't) —
+     * what keeps a banner in-app message to about half a landscape screen,
+     * scrolling past that.
+     */
+    private static final class CappedScrollView extends ScrollView {
+        private final Integer maxHeightPx;
+
+        CappedScrollView(Context context, Integer maxHeightPx) {
+            super(context);
+            this.maxHeightPx = maxHeightPx;
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            int mode = MeasureSpec.getMode(heightMeasureSpec);
+            int size = MeasureSpec.getSize(heightMeasureSpec);
+            if (maxHeightPx != null && (mode == MeasureSpec.UNSPECIFIED || size > maxHeightPx)) {
+                heightMeasureSpec = MeasureSpec.makeMeasureSpec(maxHeightPx, MeasureSpec.AT_MOST);
+            }
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec);
         }
     }
 }

@@ -35,6 +35,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
@@ -125,7 +126,13 @@ object PusherHub {
     private const val HEARTBEAT_INTERVAL_MS = 60_000L
 
     private const val REQUEST_CODE_NOTIFICATIONS = 9427
-    private const val REQUEST_CODE_LOCATION = 9428
+
+    // The widest a card-style in-app message gets: about a phone held upright,
+    // so a landscape screen or a tablet shows a card rather than a strip.
+    private const val MAX_CARD_WIDTH_DP = 560
+
+    // The widest a fullscreen message's text and buttons get.
+    private const val MAX_FULLSCREEN_WIDTH_DP = 640
 
     private lateinit var appContext: Context
     private lateinit var appKey: String
@@ -161,8 +168,6 @@ object PusherHub {
     private var timezone: String? = null
     private var state: String? = null
     private var city: String? = null
-
-    private var pendingAfterLocationPermission: (() -> Unit)? = null
 
     // True from the moment the POST_NOTIFICATIONS prompt is shown until its
     // outcome is observed. Notifications read as disabled while the dialog
@@ -350,18 +355,13 @@ object PusherHub {
      * version, language, country, timezone, state, and city.
      *
      * Brand/model/version/language/timezone are read directly from the OS —
-     * no permission needed for those. State and city additionally need a
-     * GPS fix + reverse geocoding: this prompts for ACCESS_COARSE_LOCATION
-     * (needs the Activity captured in [initialize] — same requirement as
-     * the notification permission) and uses Android's own built-in
-     * Geocoder, so no extra dependency or API key is needed for this
-     * either. If location is denied, unavailable, or there's no Activity to
-     * prompt from, this fails quietly and state/city simply stay unset —
-     * it never blocks the rest of registration.
-     *
-     * Forward your Activity's onRequestPermissionsResult() to
-     * [PusherHub.onRequestPermissionsResult] or the location prompt's result
-     * will never reach this call.
+     * no permission needed for those. State and city come from the device's
+     * IP address on the backend. Only an app that already has a location
+     * permission (it declares and asks for ACCESS_COARSE_LOCATION or
+     * ACCESS_FINE_LOCATION itself) gets them from GPS instead, through
+     * Android's own built-in Geocoder — no extra dependency or API key.
+     * This never asks for a location permission: an app without one needs
+     * no location entry in its manifest for PusherHub.
      *
      * Safe to call any time after [registerDevice] has completed.
      */
@@ -401,52 +401,34 @@ object PusherHub {
      * onRequestPermissionsResult(requestCode, permissions, grantResults)
      * here.
      *
-     * Required if you call [collectDeviceMetadata] (which may prompt for
-     * location). Optional for the notification permission: forwarding just
-     * reports the user's answer to the backend the instant they tap
-     * Allow/Don't allow instead of on the app's next foreground.
+     * Optional: forwarding just reports the user's answer to the
+     * notification permission to the backend the instant they tap
+     * Allow/Don't allow, instead of on the app's next foreground.
      */
     @JvmStatic
     fun onRequestPermissionsResult(requestCode: Int) {
         if (requestCode == REQUEST_CODE_NOTIFICATIONS) {
             syncNotificationPermissionIfChanged()
-            return
         }
-        if (requestCode != REQUEST_CODE_LOCATION) return
-        val callback = pendingAfterLocationPermission
-        pendingAfterLocationPermission = null
-        callback?.invoke()
     }
 
     /**
      * Resolves [state]/[city] (and overrides [country] with the geocoded
      * value, more trustworthy than the locale-based guess) via GPS + Android's
-     * built-in Geocoder, then always calls [onComplete] — whether resolution
-     * succeeded, failed, or was skipped entirely.
+     * built-in Geocoder — only when the app already has a location permission,
+     * never asking for one — then always calls [onComplete], whether
+     * resolution succeeded, failed, or was skipped.
      */
     private fun resolveStateAndCity(onComplete: () -> Unit) {
-        val hasPermission = ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        if (hasPermission) {
-            fetchLocationAndGeocode(onComplete)
-            return
-        }
-
-        val activity = activityRef?.get()
-        if (activity == null) {
-            Log.w(TAG, "Location permission not granted and no Activity available to request it — skipping state/city resolution.")
+        val granted = listOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION)
+            .any { ContextCompat.checkSelfPermission(appContext, it) == PackageManager.PERMISSION_GRANTED }
+        if (!granted) {
+            // State and city then come from the device's IP address.
             onComplete()
             return
         }
 
-        pendingAfterLocationPermission = {
-            if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                fetchLocationAndGeocode(onComplete)
-            } else {
-                Log.w(TAG, "Location permission denied — skipping state/city resolution.")
-                onComplete()
-            }
-        }
-        ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION), REQUEST_CODE_LOCATION)
+        fetchLocationAndGeocode(onComplete)
     }
 
     private fun fetchLocationAndGeocode(onComplete: () -> Unit) {
@@ -697,11 +679,15 @@ object PusherHub {
 
         dialog.window?.apply {
             setBackgroundDrawableResource(android.R.color.transparent)
+            // No wider than a phone held upright, centred: a landscape screen
+            // or a tablet gets a card, not a strip across it. A phone held
+            // upright is narrower than that, so it keeps the full width.
+            val cardWidth = minOf(activity.resources.displayMetrics.widthPixels, dpToPx(activity, MAX_CARD_WIDTH_DP))
             val (gravity, width, height) = when (message.type) {
-                "banner" -> Triple(Gravity.TOP, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                "bottom_sheet" -> Triple(Gravity.BOTTOM, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                "banner" -> Triple(Gravity.TOP or Gravity.CENTER_HORIZONTAL, cardWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
+                "bottom_sheet" -> Triple(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL, cardWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
                 "fullscreen" -> Triple(Gravity.CENTER, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                else -> Triple(Gravity.CENTER, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT) // modal / center_popup
+                else -> Triple(Gravity.CENTER, cardWidth, ViewGroup.LayoutParams.WRAP_CONTENT) // modal / center_popup
             }
             setGravity(gravity)
             setLayout(width, height)
@@ -720,11 +706,16 @@ object PusherHub {
             return buildHtmlView(context, message, onAction)
         }
 
-        val density = context.resources.displayMetrics.density
+        val screen = context.resources.displayMetrics
+        val density = screen.density
         fun dp(value: Int) = (value * density).toInt()
+        val isFullscreen = message.type == "fullscreen"
+        // A picture never takes more than about half the height the message
+        // has, so in landscape the heading and button stay in view beside it.
+        val maxImageHeight = (screen.heightPixels * if (isFullscreen) 0.5 else 0.4).toInt()
 
         val outer = FrameLayout(context)
-        val outerMargin = if (message.type == "fullscreen") 0 else dp(8)
+        val outerMargin = if (isFullscreen) 0 else dp(8)
         outer.setPadding(outerMargin, outerMargin, outerMargin, outerMargin)
 
         // `card` is a FrameLayout (not the LinearLayout it used to be) so an
@@ -746,18 +737,36 @@ object PusherHub {
 
         val content = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
+            // A fullscreen message sits in the middle of the screen.
+            if (isFullscreen) gravity = Gravity.CENTER_VERTICAL
             val pad = dp(message.padding ?: 16)
             setPadding(pad, pad, pad, pad)
         }
 
         val textColor = parseColorOrDefault(message.textColor, "#0F172A")
         if (message.contentMode == "blocks") {
-            buildBlocksContent(context, content, message.blocks, textColor, onAction)
+            buildBlocksContent(context, content, message.blocks, textColor, maxImageHeight, onAction)
         } else {
-            buildSimpleContent(context, content, message, textColor, onAction)
+            buildSimpleContent(context, content, message, textColor, maxImageHeight, onAction)
         }
 
-        card.addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        // Scrolls once the message is taller than the screen, as it can be
+        // in landscape; a banner stops at about half the screen. A fullscreen
+        // message fills the screen, with its content no wider than
+        // MAX_FULLSCREEN_WIDTH_DP in the middle.
+        val scroll = CappedScrollView(context, if (message.type == "banner") (screen.heightPixels * 0.6).toInt() else null).apply {
+            isFillViewport = isFullscreen
+        }
+        scroll.addView(
+            content,
+            FrameLayout.LayoutParams(
+                if (isFullscreen) minOf(screen.widthPixels, dp(MAX_FULLSCREEN_WIDTH_DP)) else ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL,
+            ),
+        )
+        val fill = if (isFullscreen) ViewGroup.LayoutParams.MATCH_PARENT else ViewGroup.LayoutParams.WRAP_CONTENT
+        card.addView(scroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, fill))
 
         if (!message.backgroundImage.isNullOrEmpty()) {
             val bgImage = ImageView(context).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
@@ -775,7 +784,7 @@ object PusherHub {
             })
         }
 
-        outer.addView(card, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        outer.addView(card, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, fill))
 
         if (message.showCloseButton) {
             outer.addView(
@@ -795,7 +804,7 @@ object PusherHub {
         return outer
     }
 
-    private fun buildSimpleContent(context: Context, container: LinearLayout, message: InAppMessage, textColor: Int, onAction: (InAppAction) -> Unit) {
+    private fun buildSimpleContent(context: Context, container: LinearLayout, message: InAppMessage, textColor: Int, maxImageHeight: Int, onAction: (InAppAction) -> Unit) {
         val density = context.resources.displayMetrics.density
         fun dp(value: Int) = (value * density).toInt()
 
@@ -807,6 +816,8 @@ object PusherHub {
             val image = ImageView(context).apply {
                 scaleType = ImageView.ScaleType.FIT_CENTER
                 adjustViewBounds = true
+                // Shrunk to fit rather than pushing the rest off a landscape screen.
+                maxHeight = maxImageHeight
             }
             loadImageAsync(message.image, image)
             container.addView(image, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -850,7 +861,7 @@ object PusherHub {
         }
     }
 
-    private fun buildBlocksContent(context: Context, container: LinearLayout, blocks: List<Map<String, Any?>>, textColor: Int, onAction: (InAppAction) -> Unit) {
+    private fun buildBlocksContent(context: Context, container: LinearLayout, blocks: List<Map<String, Any?>>, textColor: Int, maxImageHeight: Int, onAction: (InAppAction) -> Unit) {
         val density = context.resources.displayMetrics.density
         fun dp(value: Int) = (value * density).toInt()
 
@@ -890,6 +901,7 @@ object PusherHub {
                         val image = ImageView(context).apply {
                             scaleType = ImageView.ScaleType.FIT_CENTER
                             adjustViewBounds = true
+                            maxHeight = maxImageHeight
                         }
                         loadImageAsync(url, image)
                         image.setOnClickListener { handleBlockClick(block, onAction) }
@@ -972,6 +984,8 @@ object PusherHub {
             }
         }
     }
+
+    private fun dpToPx(context: Context, dp: Int): Int = (dp * context.resources.displayMetrics.density).toInt()
 
     private fun parseColorOrDefault(hex: String?, default: String): Int {
         return try {
@@ -1518,4 +1532,21 @@ private fun Any?.toKotlinValue(): Any? = when (this) {
     is JSONArray -> (0 until length()).map { get(it).toKotlinValue() }
     JSONObject.NULL -> null
     else -> this
+}
+
+/**
+ * A ScrollView that stops growing at [maxHeightPx] (none: it doesn't) — what keeps a banner
+ * in-app message to about half a landscape screen, scrolling past that.
+ */
+private class CappedScrollView(context: Context, private val maxHeightPx: Int?) : ScrollView(context) {
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val mode = MeasureSpec.getMode(heightMeasureSpec)
+        val size = MeasureSpec.getSize(heightMeasureSpec)
+        val capped = if (maxHeightPx != null && (mode == MeasureSpec.UNSPECIFIED || size > maxHeightPx)) {
+            MeasureSpec.makeMeasureSpec(maxHeightPx, MeasureSpec.AT_MOST)
+        } else {
+            heightMeasureSpec
+        }
+        super.onMeasure(widthMeasureSpec, capped)
+    }
 }
